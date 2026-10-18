@@ -1,0 +1,8 @@
+__pycache__/
+*.py[oc]
+.venv/
+.run/
+local-answers.txt
+cookies.txt
+*.cast
+*.jwt

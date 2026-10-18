@@ -1,0 +1,20 @@
+# Render Blueprint for the cloud service (Q3, Q4, Q5, Q7, Q8, Q11, Q12)
+services:
+  - type: web
+    name: tds-ga2-24f2007853
+    runtime: python
+    plan: free
+    rootDir: cloud
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      # Q5 layer 4: OS-level environment variables (APP_* prefix)
+      - key: APP_WORKERS
+        value: "1"
+      - key: APP_LOG_LEVEL
+        value: debug
+      - key: APP_API_KEY
+        value: key-thf4tbmrx9

@@ -1,0 +1,19 @@
+# Render's free tier sleeps after 15 idle minutes and takes ~1 minute to wake.
+# This pings the service every 10 minutes until the end of October so graders
+# never hit a cold start. Set the repo variable SERVICE_URL if Render gave the
+# service a different address.
+name: keepalive
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the Render service
+        env:
+          URL: ${{ vars.SERVICE_URL || 'https://tds-ga2-24f2007853.onrender.com' }}
+        run: |
+          if [ "$(date -u +%Y%m%d)" -gt 20261031 ]; then echo "past cutoff, skipping"; exit 0; fi
+          curl -sS -m 90 -o /dev/null -w "%{http_code} in %{time_total}s\n" "$URL/" || true
