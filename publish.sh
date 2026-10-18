@@ -54,8 +54,9 @@ git push -q -u origin main || die "git push failed"
 RAW="https://raw.githubusercontent.com/$OWNER/$REPO_NAME/main"
 check() { # path label
   local url="$RAW/$1" code i
-  for ((i = 0; i < 20; i++)); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' "$url")
+  for ((i = 0; i < 10; i++)); do
+    # cache-busting query: raw.githubusercontent.com can serve a stale 404 for minutes
+    code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$url?nocache=$RANDOM$i")
     [ "$code" = 200 ] && break
     sleep 3
   done

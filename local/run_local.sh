@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # TDS GA2 - local services, each behind a Cloudflare quick tunnel:
 #   Q6  docker compose (FastAPI api + Redis)      -> port 8000
-#   Q9  Ollama OpenAI-compatible chat endpoint    -> port 11434
-#   Q10 /extract service (local LLM + validation) -> port 8001
+#   Q9  Ollama /v1 chat endpoint via the LLM app  -> port 8001 (/v1/*)
+#   Q10 /extract (local LLM + validation), same app -> port 8001
 # Installs what is missing, starts everything, self-tests the PUBLIC urls and
 # prints the three answers. Run from WSL:   bash local/run_local.sh
 set -uo pipefail
@@ -29,8 +29,8 @@ wait_http() { # url seconds
 
 # --------------------------------------------------------------------------- tools
 info "Checking tools"
-printf '  Docker and the Ollama CORS setting need sudo. Type your WSL password if asked (it is not shown).\n'
-sudo -v || die "sudo is needed for Docker and the Ollama CORS setting"
+printf '  Docker and the Ollama service need sudo. Type your WSL password if asked (it is not shown).\n'
+sudo -v || die "sudo is needed for Docker and the Ollama service"
 command -v curl >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq curl; }
 if ! command -v cloudflared >/dev/null; then
   curl -fsSL -o "$HOME/.local/bin/cloudflared" \
@@ -85,32 +85,31 @@ ok "$($DOCKER compose version | head -1)"
 # --------------------------------------------------------------------------- Ollama
 info "Ollama ($MODEL)"
 command -v ollama >/dev/null || { curl -fsSL https://ollama.com/install.sh | sh || die "Ollama install failed"; }
-
-ollama_up() { curl -fsS -m 3 -o /dev/null http://127.0.0.1:11434/api/version 2>/dev/null; }
-ollama_cors_ok() {
-  curl -sS -m 5 -o /dev/null -D - -X OPTIONS http://127.0.0.1:11434/v1/chat/completions \
-    -H 'Origin: https://cors-check.example.com' -H 'Access-Control-Request-Method: POST' \
-    -H 'Access-Control-Request-Headers: content-type' 2>/dev/null |
-    grep -qi '^access-control-allow-origin'
-}
-restart_ollama_with_cors() {
-  if [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ] && systemctl list-unit-files ollama.service >/dev/null 2>&1 &&
-    systemctl cat ollama >/dev/null 2>&1; then
-    sudo mkdir -p /etc/systemd/system/ollama.service.d
-    printf '[Service]\nEnvironment="OLLAMA_ORIGINS=*"\n' | sudo tee /etc/systemd/system/ollama.service.d/cors.conf >/dev/null
-    sudo systemctl daemon-reload && sudo systemctl restart ollama
-  else
-    pkill -f 'ollama serve' 2>/dev/null
-    sleep 1
-    OLLAMA_ORIGINS='*' nohup ollama serve >"$RUN/ollama.log" 2>&1 &
-  fi
-}
-if ! ollama_up || ! ollama_cors_ok; then
-  restart_ollama_with_cors
-  wait_http http://127.0.0.1:11434/api/version 60 || die "Ollama did not start (see $RUN/ollama.log)"
+# Browser CORS for Q9 is handled by the /extract app (it forwards /v1/* to Ollama),
+# so OLLAMA_ORIGINS no longer matters. What matters is that exactly ONE Ollama owns
+# port 11434: a stray user-level 'ollama serve' and the systemd service otherwise
+# fight over it. Keep whichever one already has the model on disk.
+MF="manifests/registry.ollama.ai/library/${MODEL%%:*}/${MODEL##*:}"
+SYS_MODELS=/usr/share/ollama/.ollama/models
+USR_MODELS="$HOME/.ollama/models"
+has_service() { systemctl cat ollama >/dev/null 2>&1; }
+if has_service && { sudo test -e "$SYS_MODELS/$MF" || [ ! -e "$USR_MODELS/$MF" ]; }; then
+  pkill -u "$USER" -f '^ollama serve' 2>/dev/null && sleep 2
+  sudo systemctl enable ollama >/dev/null 2>&1
+  sudo systemctl restart ollama || die "could not restart the ollama service"
+  OLLAMA_KIND="systemd service"
+else
+  has_service && sudo systemctl disable --now ollama >/dev/null 2>&1
+  pkill -u "$USER" -f '^ollama serve' 2>/dev/null && sleep 2
+  OLLAMA_KEEP_ALIVE=24h setsid nohup ollama serve >"$RUN/ollama.log" 2>&1 </dev/null &
+  OLLAMA_KIND="user-level server"
 fi
-ollama_cors_ok || die "Ollama is up but without OLLAMA_ORIGINS=*. If the Windows Ollama app is running, quit it from the tray and re-run."
-ok "Ollama $(curl -fsS http://127.0.0.1:11434/api/version) with CORS for all origins"
+wait_http http://127.0.0.1:11434/api/version 60 || {
+  tail -20 "$RUN/ollama.log" 2>/dev/null
+  sudo journalctl -u ollama -n 20 --no-pager 2>/dev/null
+  die "Ollama did not start (log above)"
+}
+ok "Ollama $(curl -fsS http://127.0.0.1:11434/api/version) ($OLLAMA_KIND)"
 if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$MODEL"; then
   info "Downloading $MODEL (one-time)"
   ollama pull "$MODEL" || die "ollama pull failed"
@@ -156,12 +155,15 @@ tunnel_url() { # name
   done
   return 1
 }
+# Two tunnels: Q6 (port 8000) and the LLM app (port 8001), which serves both
+# Q10's /extract and Q9's /v1/chat/completions. One tunnel per port, because
+# start_tunnel replaces any tunnel already pointing at the same port.
 start_tunnel q6 8000
-start_tunnel q9 11434 --http-host-header localhost:11434
-start_tunnel q10 8001
-Q6_URL=$(tunnel_url q6) || die "no tunnel URL for Q6 (see $RUN/tunnel-q6.log)"
-Q9_URL=$(tunnel_url q9) || die "no tunnel URL for Q9 (see $RUN/tunnel-q9.log)"
-Q10_URL=$(tunnel_url q10) || die "no tunnel URL for Q10 (see $RUN/tunnel-q10.log)"
+start_tunnel llm 8001
+Q6_URL=$(tunnel_url q6) || { tail -5 "$RUN/tunnel-q6.log"; die "no tunnel URL for Q6 (log above)"; }
+LLM_URL=$(tunnel_url llm) || { tail -5 "$RUN/tunnel-llm.log"; die "no tunnel URL for the LLM app (log above)"; }
+Q9_URL="$LLM_URL"
+Q10_URL="$LLM_URL"
 ok "Q6  $Q6_URL"
 ok "Q9  $Q9_URL"
 ok "Q10 $Q10_URL"
@@ -187,7 +189,7 @@ else
   FAIL=1
 fi
 
-wait_http "$Q9_URL/api/version" 120 || warn "Q9 tunnel not reachable yet"
+wait_http "$Q9_URL/healthz" 120 || warn "Q9 tunnel not reachable yet"
 R9=$(curl -sS -m 90 -D "$RUN/q9-headers.txt" "$Q9_URL/v1/chat/completions" \
   -H 'Content-Type: application/json' -H 'Origin: https://exam.sanand.workers.dev' \
   -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 37 + 48? Also repeat this token exactly: TKa1b2c3\"}],\"stream\":false}")

@@ -20,7 +20,7 @@ from datetime import date
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -355,6 +355,35 @@ async def extract(request: Request):
         return JSONResponse({"detail": "could not extract all invoice fields", "errors": errors}, status_code=422)
     except Exception as exc:  # never a 500
         return JSONResponse({"detail": f"could not process input: {exc}"}, status_code=422)
+
+
+# --------------------------------------------------------------------------- #
+# Q9: OpenAI-compatible chat endpoint = Ollama's /v1 behind this app's CORS.
+# The browser's Origin header is not forwarded, so Ollama's own OLLAMA_ORIGINS
+# setting does not matter; CORSMiddleware above answers preflights with "*".
+# --------------------------------------------------------------------------- #
+SKIP_HEADERS = {
+    "host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "trailer",
+    "upgrade", "origin", "referer", "accept-encoding", "proxy-authorization", "proxy-authenticate",
+}
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST"])
+async def ollama_openai_proxy(path: str, request: Request):
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in SKIP_HEADERS and not k.lower().startswith(("sec-", "access-control-", "cf-", "x-forwarded"))
+    }
+    try:
+        async with httpx.AsyncClient(timeout=float(os.environ.get("PROXY_TIMEOUT", "180"))) as client:
+            r = await client.request(
+                request.method, f"{OLLAMA_URL}/v1/{path}", params=request.query_params,
+                content=await request.body(), headers=headers,
+            )
+    except Exception as exc:
+        return JSONResponse({"error": {"message": f"local model unavailable: {exc}"}}, status_code=502)
+    return Response(content=r.content, status_code=r.status_code,
+                    media_type=r.headers.get("content-type", "application/json"))
 
 
 @app.get("/healthz")

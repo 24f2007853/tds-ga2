@@ -65,14 +65,21 @@ def ask(token: str, model: str, prompt: str) -> str:
         "max_completion_tokens": 2048,
     }).encode()
     for attempt in range(4):
+        # A browser-like User-Agent: Cloudflare in front of AI Pipe blocks Python's
+        # default one with "error code: 1010".
         req = urllib.request.Request(URL, data=body, method="POST", headers={
-            "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            "Authorization": f"Bearer {token}", "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"})
         try:
             with urllib.request.urlopen(req, timeout=90) as r:
                 data = json.load(r)
             return data["choices"][0]["message"]["content"] or ""
         except urllib.error.HTTPError as e:
             msg = e.read().decode(errors="replace")[:200]
+            if "1010" in msg:
+                sys.exit(f"Cloudflare blocked this client ({e.code}, {msg}); tell Claude")
             if e.code in (401, 403):
                 sys.exit(f"AI Pipe rejected the token ({e.code}): {msg}")
             if attempt == 3:
